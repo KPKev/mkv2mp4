@@ -1365,32 +1365,103 @@ class ConverterApp:
 
             while True:
                 if self.cancel_requested:
+                    self.log_message(
+                        f"Cancellation requested during active conversion of {input_mkv}.",
+                        "INFO",
+                    )
                     if self.current_ffmpeg_process:
                         try:
-                            self.current_ffmpeg_process.terminate()  # Terminate FFmpeg if running
-                        except OSError:
-                            pass  # Process might have already exited
-                        self.current_ffmpeg_process.wait()  # Ensure it's fully terminated
+                            if (
+                                self.current_ffmpeg_process.poll() is None
+                            ):  # If still running
+                                self.log_message(
+                                    f"Terminating FFmpeg process {self.current_ffmpeg_process.pid} due to cancellation.",
+                                    "INFO",
+                                )
+                                self.current_ffmpeg_process.terminate()
+                                self.current_ffmpeg_process.wait(
+                                    timeout=1
+                                )  # Short wait for terminate
+                                if (
+                                    self.current_ffmpeg_process.poll() is None
+                                ):  # Still running?
+                                    self.log_message(
+                                        f"FFmpeg process {self.current_ffmpeg_process.pid} did not terminate, killing.",
+                                        "WARN",
+                                    )
+                                    self.current_ffmpeg_process.kill()
+                                    self.current_ffmpeg_process.wait(
+                                        timeout=1
+                                    )  # Short wait for kill
+                        except OSError as e:
+                            self.log_message(
+                                f"OSError while terminating/killing FFmpeg on cancel: {e}",
+                                "ERROR",
+                            )
+                        except Exception as e:  # Catch any other potential errors
+                            self.log_message(
+                                f"Exception while terminating/killing FFmpeg on cancel: {e}",
+                                "ERROR",
+                            )
                     self.current_ffmpeg_process = None
-                    self.log_message(
-                        f"Conversion of {input_mkv} cancelled during pause.", "INFO"
-                    )
-                    return False, "Conversion cancelled during pause."
+                    if self.psutil_process:  # Clean up psutil process if it exists
+                        self.psutil_process = None
+                    # Clean up partially converted file if it exists
+                    if output_file_path and os.path.exists(output_file_path):
+                        try:
+                            os.remove(output_file_path)
+                            self.log_message(
+                                f"Deleted partially converted file on cancel: {output_file_path}",
+                                "INFO",
+                            )
+                        except OSError as e:
+                            self.log_message(
+                                f"Error deleting partial file {output_file_path} on cancel: {e}",
+                                "ERROR",
+                            )
+                    return False, "Conversion cancelled by user."
 
+                # This is the GUI-level pause check; psutil pause is handled by toggle_pause_resume
+                # but self.is_paused is set by it.
                 while self.is_paused:
-                    if self.cancel_requested:  # Check cancel during pause
+                    if (
+                        self.cancel_requested
+                    ):  # Re-check cancel during this inner pause loop
+                        self.log_message(
+                            f"Cancellation requested during pause for {input_mkv}.",
+                            "INFO",
+                        )
                         if self.current_ffmpeg_process:
                             try:
-                                self.current_ffmpeg_process.terminate()
-                            except OSError:
-                                pass
-                            self.current_ffmpeg_process.wait()
+                                if self.current_ffmpeg_process.poll() is None:
+                                    self.current_ffmpeg_process.terminate()
+                                    self.current_ffmpeg_process.wait(timeout=1)
+                                if self.current_ffmpeg_process.poll() is None:
+                                    self.current_ffmpeg_process.kill()
+                                    self.current_ffmpeg_process.wait(timeout=1)
+                            except Exception as e:
+                                self.log_message(
+                                    f"Exception during cancel-in-pause for FFmpeg: {e}",
+                                    "ERROR",
+                                )
                         self.current_ffmpeg_process = None
-                        self.log_message(
-                            f"Conversion of {input_mkv} cancelled during pause.", "INFO"
-                        )
+                        if self.psutil_process:
+                            self.psutil_process = None
+                        # Clean up partially converted file if it exists (also for cancel during pause)
+                        if output_file_path and os.path.exists(output_file_path):
+                            try:
+                                os.remove(output_file_path)
+                                self.log_message(
+                                    f"Deleted partially converted file on cancel (during pause): {output_file_path}",
+                                    "INFO",
+                                )
+                            except OSError as e:
+                                self.log_message(
+                                    f"Error deleting partial file {output_file_path} on cancel (during pause): {e}",
+                                    "ERROR",
+                                )
                         return False, "Conversion cancelled during pause."
-                    time.sleep(0.1)  # Sleep briefly while paused
+                    time.sleep(0.1)
 
                 if self.current_ffmpeg_process and self.current_ffmpeg_process.stderr:
                     line = self.current_ffmpeg_process.stderr.readline()
@@ -1429,6 +1500,7 @@ class ConverterApp:
                     and self.current_ffmpeg_process.poll() is not None
                 ):
                     break
+                time.sleep(0.01)  # Prevent tight loop if stderr is quiet
 
             if (
                 self.current_ffmpeg_process
