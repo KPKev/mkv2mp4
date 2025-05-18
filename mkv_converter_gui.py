@@ -20,6 +20,29 @@ class ConverterApp:
         # Initial geometry, might be adjusted by notebook packing
         master.geometry("620x950")
 
+        # Set application icon
+        try:
+            icon_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "app_icon.png"
+            )
+            if getattr(sys, "frozen", False) and hasattr(
+                sys, "_MEIPASS"
+            ):  # PyInstaller temporary path
+                icon_path = os.path.join(sys._MEIPASS, "app_icon.png")
+
+            if os.path.exists(icon_path):
+                img = tk.PhotoImage(file=icon_path)
+                master.iconphoto(True, img)
+            else:
+                self.log_message(f"Icon file not found at {icon_path}", "WARN")
+        except tk.TclError as e:
+            self.log_message(
+                f"Error setting icon: {e}. Ensure app_icon.png is a valid PNG file.",
+                "ERROR",
+            )
+        except Exception as e:
+            self.log_message(f"Unexpected error setting icon: {e}", "ERROR")
+
         # Create the Notebook (tabbed interface)
         self.notebook = ttk.Notebook(master)
         self.notebook.pack(expand=True, fill="both", padx=5, pady=5)
