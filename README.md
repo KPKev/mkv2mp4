@@ -115,6 +115,58 @@ Converted files will be saved in the same directory as their original MKV files:
 - Level 1 Retry: `[original_filename_without_ext]_retry1.mp4`
 - Level 2 Retry: `[original_filename_without_ext]_retry2.mp4`
 
+## Building from Source (Creating an Executable)
+
+You can create a standalone executable for Windows using PyInstaller.
+
+1.  **Install PyInstaller and Pillow**:
+    If you haven't already, install PyInstaller and Pillow (Pillow is used by PyInstaller to handle the `.png` icon conversion to `.ico` during the build). You can install them using the `requirements.txt` or manually:
+
+    ```bash
+    pip install pyinstaller Pillow
+    # Or update existing requirements.txt and run:
+    # pip install -r requirements.txt
+    ```
+
+2.  **Ensure FFmpeg and Icon are Present**:
+
+    - The build process expects the `ffmpeg` directory (containing `ffmpeg.exe`, etc.) and `app_icon.png` to be in the root of the project directory (same level as `mkv_converter_gui.py`).
+
+3.  **Generate the Spec File (One-time)**:
+    Navigate to the project's root directory in your terminal and run:
+
+    ```bash
+    pyi-makespec --name MKV2MP4Converter --windowed --icon=app_icon.png --add-data "ffmpeg;ffmpeg" --add-data "app_icon.png;." mkv_converter_gui.py
+    ```
+
+    This creates `MKV2MP4Converter.spec`.
+
+4.  **Modify the Spec File (One-time, if needed)**:
+    Open `MKV2MP4Converter.spec` and ensure `psutil` is listed in `hiddenimports`:
+
+    ```python
+    # ...
+    a = Analysis(
+        # ...
+        hiddenimports=['psutil'], # Ensure 'psutil' is here
+        # ...
+    )
+    # ...
+    ```
+
+    The provided spec file in the repository should already have this.
+
+5.  **Build the Executable**:
+    Run PyInstaller with the spec file:
+
+    ```bash
+    pyinstaller MKV2MP4Converter.spec
+    ```
+
+6.  **Find the Executable**:
+    - After a successful build, the standalone executable (`MKV2MP4Converter.exe`) and all its necessary files will be located in the `dist/MKV2MP4Converter` directory.
+    - You can copy the entire `MKV2MP4Converter` folder from `dist` to another location and run the application from there.
+
 ## License
 
 Copyright (c) [2025] [KPKev]

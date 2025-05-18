@@ -29,7 +29,7 @@ MANIFEST
 # PyInstaller
 #  Usually these files are written by a PyInstaller script; adding them
 #  here helps prevent accidentally committing them if they are created locally.
-*.spec
+# *.spec # Keep spec files versioned
 
 # Output files from this project
 *.mp4
