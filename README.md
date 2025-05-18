@@ -1,8 +1,10 @@
 # MKV2MP4 Converter (Batch)
 
+**User-friendly GUI to batch convert video files (MKV, etc.) to MP4 (H.264/AAC). Power up your media management with NVIDIA GPU acceleration, automated recursive folder scanning (ideal for Plex/media libraries) to find & convert non-MP4 files, configurable auto-deletion, multi-level retries, and detailed logging. Perfect for standardizing large video collections.**
+
 ## Description
 
-This is a Python-based GUI application using Tkinter to batch convert MKV video files to MP4 format (H.264 video + AAC audio). It provides a user-friendly interface to manage a queue of files, monitor conversion progress, handle failed conversions with multi-level retry options, and optionally use GPU acceleration for faster conversions. It also includes a feature to monitor a specified media folder for non-MP4 files and automatically add them to the conversion queue. The application features a tabbed interface for separating conversion controls and logs, and persists queue and settings data between sessions. It also includes a custom application icon.
+This is a Python-based GUI application using Tkinter to batch convert video files (primarily MKV, but scans for others like AVI, MOV) to MP4 format (H.264 video + AAC audio). It provides a user-friendly interface to manage a queue of files, monitor conversion progress, handle failed conversions with multi-level retry options, and optionally use GPU acceleration for faster conversions. It also includes a feature to monitor a specified media folder (and its subdirectories) for common video files that are not already in MP4 format, automatically adding them to the conversion queue. The application features a tabbed interface for separating conversion controls and logs, and persists queue and settings data between sessions. It also includes a custom application icon.
 
 ## Features
 
