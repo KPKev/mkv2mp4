@@ -7,16 +7,50 @@ import sys
 import re  # For parsing ffmpeg output
 import time
 import psutil  # For process pause/resume
-import signal  # For POSIX signals (fallback or direct use)
+from datetime import datetime  # For log timestamps
+import json  # For saving/loading application state
 
 
 class ConverterApp:
+    STATE_FILE = "mkv_converter_state.json"
+
     def __init__(self, master):
         self.master = master
         master.title("MKV2MP4 Converter (Batch)")
-        master.geometry(
-            "600x750"
-        )  # Adjusted window size for new buttons + individual progress
+        # Initial geometry, might be adjusted by notebook packing
+        master.geometry("620x950")
+
+        # Create the Notebook (tabbed interface)
+        self.notebook = ttk.Notebook(master)
+        self.notebook.pack(expand=True, fill="both", padx=5, pady=5)
+
+        # --- Create Frames for Tabs ---
+        self.converter_tab_frame = ttk.Frame(self.notebook, padding=10)
+        self.logs_tab_frame = ttk.Frame(self.notebook, padding=10)
+
+        self.notebook.add(self.converter_tab_frame, text="Converter")
+        self.notebook.add(self.logs_tab_frame, text="Logs")
+
+        # --- Populate Logs Tab ---
+        log_text_frame = tk.LabelFrame(
+            self.logs_tab_frame, text="Application Logs", padx=5, pady=5
+        )
+        log_text_frame.pack(expand=True, fill="both", padx=5, pady=5)
+        self.log_text_area = tk.Text(
+            log_text_frame, wrap=tk.WORD, state=tk.DISABLED, height=10
+        )  # Start disabled
+        log_scrollbar_y = tk.Scrollbar(
+            log_text_frame, orient="vertical", command=self.log_text_area.yview
+        )
+        self.log_text_area.config(yscrollcommand=log_scrollbar_y.set)
+        log_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text_area.pack(side=tk.LEFT, expand=True, fill="both")
+        # Make log_text_area temporarily normal to add initial message, then disable again
+        self.log_message("Application initialized.", "INFO")
+
+        # --- All other UI elements will now go into self.converter_tab_frame ---
+        # Adjust references from 'master' to 'self.converter_tab_frame' for main UI elements
+        main_ui_container = self.converter_tab_frame
 
         self.file_queue = []
         self.failed_files_data = []  # Stores (file_path, error_reason_string)
@@ -38,16 +72,29 @@ class ConverterApp:
         self.is_paused = False  # To track pause state
         self.cancel_requested = False  # To signal cancellation of the batch
         self.conversion_thread = None  # To store the conversion thread object
+        self.plex_media_directory = tk.StringVar(value="Not Set")  # For Plex media path
+        self.auto_delete_verified_originals = tk.BooleanVar(
+            value=False
+        )  # For auto-deletion toggle
+        self.plex_scan_interval_minutes_sv = tk.StringVar(value="10")  # UI for interval
+        self.auto_start_plex_conversions = tk.BooleanVar(
+            value=False
+        )  # For auto-start toggle
+        self.is_monitoring_plex = False  # True if Plex monitoring is active
+        self.plex_monitoring_thread = None  # Thread for Plex monitoring
+        self.plex_scan_interval_seconds = 600  # e.g., 10 minutes
 
-        # --- UI Elements ---
+        # --- UI Elements (now placed in main_ui_container which is converter_tab_frame) ---
         current_row = 0
         # File Queue Management Frame
-        queue_frame = tk.LabelFrame(master, text="Conversion Queue", padx=5, pady=5)
+        queue_frame = tk.LabelFrame(
+            main_ui_container, text="Conversion Queue", padx=5, pady=5
+        )
         queue_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=10, sticky="ewns"
         )
-        master.grid_rowconfigure(current_row, weight=1)
-        master.grid_columnconfigure(0, weight=1)
+        main_ui_container.grid_rowconfigure(current_row, weight=1)
+        main_ui_container.grid_columnconfigure(0, weight=1)
         current_row += 1
 
         self.queue_listbox = tk.Listbox(
@@ -61,7 +108,7 @@ class ConverterApp:
         self.queue_listbox.config(yscrollcommand=queue_scrollbar.set)
 
         # Buttons for Queue Management Frame
-        button_frame = tk.Frame(master)
+        button_frame = tk.Frame(main_ui_container)
         button_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=5, sticky="ew"
         )
@@ -82,11 +129,13 @@ class ConverterApp:
         self.clear_queue_button.pack(side=tk.LEFT, padx=5)
 
         # Failed Files Frame
-        failed_frame = tk.LabelFrame(master, text="Failed Conversions", padx=5, pady=5)
+        failed_frame = tk.LabelFrame(
+            main_ui_container, text="Failed Conversions", padx=5, pady=5
+        )
         failed_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=5, sticky="ewns"
         )
-        master.grid_rowconfigure(current_row, weight=1)
+        main_ui_container.grid_rowconfigure(current_row, weight=1)
         current_row += 1
 
         self.failed_listbox = tk.Listbox(
@@ -100,7 +149,7 @@ class ConverterApp:
         self.failed_listbox.config(yscrollcommand=failed_scrollbar.set)
 
         # Buttons for Failed Files Frame
-        failed_button_frame = tk.Frame(master)
+        failed_button_frame = tk.Frame(main_ui_container)
         failed_button_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=5, sticky="ew"
         )
@@ -131,7 +180,7 @@ class ConverterApp:
         self.clear_failed_button.pack(side=tk.LEFT, padx=5)
 
         # Output Format Selection
-        format_frame = tk.Frame(master)
+        format_frame = tk.Frame(main_ui_container)
         format_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=10, sticky="ew"
         )
@@ -151,7 +200,7 @@ class ConverterApp:
             self.format_dropdown.config(state=tk.DISABLED)
 
         # Action Buttons Frame (Start, Pause, Cancel)
-        action_frame = tk.Frame(master)
+        action_frame = tk.Frame(main_ui_container)
         action_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=10, sticky="ew"
         )
@@ -185,7 +234,7 @@ class ConverterApp:
         current_row += 1
 
         # Overall Progress Bar
-        overall_progress_frame = tk.Frame(master)
+        overall_progress_frame = tk.Frame(main_ui_container)
         overall_progress_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=5, sticky="ew"
         )
@@ -199,7 +248,7 @@ class ConverterApp:
         self.overall_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         # Individual File Progress Bar
-        individual_progress_frame = tk.Frame(master)
+        individual_progress_frame = tk.Frame(main_ui_container)
         individual_progress_frame.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=5, sticky="ew"
         )
@@ -218,12 +267,91 @@ class ConverterApp:
 
         # Status Label
         self.status_label = tk.Label(
-            master, textvariable=self.conversion_status, relief=tk.SUNKEN, anchor="w"
+            main_ui_container,
+            textvariable=self.conversion_status,
+            relief=tk.SUNKEN,
+            anchor="w",
         )
         self.status_label.grid(
             row=current_row, column=0, columnspan=4, padx=10, pady=10, sticky="ew"
         )
         current_row += 1
+
+        # --- Plex Mode / Automatic Conversion Frame ---
+        plex_frame = tk.LabelFrame(
+            main_ui_container, text="Automatic MKV Folder Conversion", padx=5, pady=5
+        )
+        plex_frame.grid(
+            row=current_row, column=0, columnspan=4, padx=10, pady=10, sticky="ewns"
+        )
+        current_row += 1
+
+        self.select_plex_dir_button = tk.Button(
+            plex_frame,
+            text="Select Media Folder...",
+            command=self.select_plex_directory,
+        )
+        self.select_plex_dir_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.plex_dir_label = tk.Label(
+            plex_frame,
+            textvariable=self.plex_media_directory,
+            relief=tk.SUNKEN,
+            width=50,
+            anchor="w",
+        )
+        self.plex_dir_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
+
+        plex_action_frame = tk.Frame(
+            main_ui_container
+        )  # New frame for scan button to be below directory selection
+        plex_action_frame.grid(
+            row=current_row, column=0, columnspan=4, padx=10, pady=0, sticky="ew"
+        )  # pady=0 for closer spacing
+        current_row += 1  # Keep current_row before this frame's content
+
+        # Frame for interval Entry and Scan button to be on the same conceptual level
+        plex_controls_subframe = tk.Frame(plex_action_frame)
+        plex_controls_subframe.pack(pady=5)
+
+        tk.Label(plex_controls_subframe, text="Scan Interval (min):").pack(
+            side=tk.LEFT, padx=(0, 5)
+        )
+        self.plex_interval_entry = tk.Entry(
+            plex_controls_subframe,
+            textvariable=self.plex_scan_interval_minutes_sv,
+            width=5,
+        )
+        self.plex_interval_entry.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.scan_plex_dir_button = tk.Button(
+            plex_controls_subframe,  # Add to subframe
+            text="Start Plex Monitoring",  # Changed text
+            command=self.toggle_plex_monitoring,  # Changed command
+            state=tk.DISABLED,
+        )
+        self.scan_plex_dir_button.pack(
+            side=tk.LEFT
+        )  # pady removed, handled by subframe pack
+
+        self.auto_delete_checkbox = tk.Checkbutton(
+            plex_action_frame,  # Remains in plex_action_frame, but below the subframe
+            text="Automatically delete original after verified conversion (USE WITH CAUTION!)",
+            variable=self.auto_delete_verified_originals,
+        )
+        self.auto_delete_checkbox.pack(pady=(5, 0))  # Add some padding below
+
+        self.auto_start_conversion_checkbox = tk.Checkbutton(
+            plex_action_frame,
+            text="Automatically start conversion when scan adds files to queue",
+            variable=self.auto_start_plex_conversions,
+        )
+        self.auto_start_conversion_checkbox.pack(pady=(0, 5))
+
+        current_row += 1  # Increment after all content of plex_action_frame
+
+        # Adjust master window geometry for new section
+        # master.geometry("600x910") # Notebook handles overall geometry now
 
         # Bind window close event
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -244,6 +372,7 @@ class ConverterApp:
         else:
             self.update_status_on_ffmpeg_ready()
         self.update_status_with_queue_count()  # Ensure buttons are correctly set initially
+        self.load_state()  # Load previous state at the end of init
 
     def update_status_on_ffmpeg_ready(self):
         if self.ffmpeg_exec_path == "ffmpeg":
@@ -464,7 +593,7 @@ class ConverterApp:
                 f"{current_ffmpeg_status} | Files remaining in queue: {queue_count}"
             )
             self.individual_progress_status.set(
-                f"Individual File Progress: Processing..."
+                "Individual File Progress: Processing..."
             )
             # UI state for buttons is handled by toggle_ui_state(False)
         else:
@@ -472,7 +601,7 @@ class ConverterApp:
                 f"{current_ffmpeg_status} | Queue: {queue_count} file(s)."
             )
             self.individual_progress_bar["value"] = 0
-            self.individual_progress_status.set(f"Individual File Progress: N/A")
+            self.individual_progress_status.set("Individual File Progress: N/A")
             # UI state for buttons is handled by toggle_ui_state(True)
             # Call toggle_ui_state to ensure buttons reflect current state (e.g. Convert button if queue populated)
             self.toggle_ui_state(True)
@@ -671,7 +800,7 @@ class ConverterApp:
                 ),
             )
 
-            conversion_result, error_msg = self.convert_file(
+            conversion_result, result_payload = self.convert_file(
                 current_file_path, retry_level=retry_level_to_attempt
             )
 
@@ -682,6 +811,7 @@ class ConverterApp:
                 self.files_for_retry_level_2.discard(current_file_path)
 
             if self.cancel_requested:
+                self.log_message("Batch cancelled during conversion of a file.", "INFO")
                 self.master.after(
                     0,
                     lambda: self.conversion_status.set(
@@ -700,20 +830,24 @@ class ConverterApp:
                 )
                 self.file_queue.pop(actual_index_in_live_queue)
             except ValueError:
-                print(
-                    f"Warning: {current_file_name} not found in live queue for removal after processing."
+                self.log_message(
+                    f"Warning: {current_file_name} not found in live queue for removal after processing.",
+                    "WARN",
                 )
+                # print(
+                #     f"Warning: {current_file_name} not found in live queue for removal after processing."
+                # )
 
             if not conversion_result:
                 self.master.after(
                     0,
-                    lambda path=current_file_path, err=error_msg: (
+                    lambda path=current_file_path, err=result_payload: (
                         self.failed_files_data.append((path, err)),
                         self.failed_listbox.insert(tk.END, os.path.basename(path)),
                     ),
                 )
                 # Error message now shown by convert_file's return or here directly
-                # self.master.after(0, lambda: messagebox.showerror("Conversion Failed", f"Failed to convert: {current_file_name}. Moved to Failed List. Error: {error_msg}"))
+                # self.master.after(0, lambda: messagebox.showerror("Conversion Failed", f"Failed to convert: {current_file_name}. Moved to Failed List. Error: {result_payload}"))
 
             files_processed_in_batch += 1
             self.master.after(
@@ -724,6 +858,164 @@ class ConverterApp:
                 ),
             )
             self.master.after(0, self.update_status_with_queue_count)
+
+            # Post-conversion processing (verification and potential deletion)
+            if conversion_result:  # True if successful
+                output_file_path = (
+                    result_payload  # This is the output_file_path from convert_file
+                )
+                plex_dir_display = self.plex_media_directory.get()
+                plex_dir_actual = os.path.normpath(
+                    plex_dir_display.replace(" (Monitoring Active)", "").strip()
+                )
+                current_file_path_normalized = os.path.normpath(current_file_path)
+
+                self.log_message(
+                    f"Auto-delete check: Plex dir actual: '{plex_dir_actual}', Current file normalized: '{current_file_path_normalized}'",
+                    "DEBUG",
+                )
+
+                # Check if original file is within the selected media directory and auto-delete is on
+                is_within_plex_dir = False
+                if (
+                    plex_dir_actual
+                    and plex_dir_actual != os.path.normpath("Not Set")
+                    and os.path.isdir(plex_dir_actual)
+                ):
+                    common_path = os.path.commonpath(
+                        [current_file_path_normalized, plex_dir_actual]
+                    )
+                    self.log_message(
+                        f"Auto-delete check: Common path: '{common_path}', Plex_dir_actual: '{plex_dir_actual}'",
+                        "DEBUG",
+                    )
+                    # Normalize for comparison too, especially for case sensitivity on some systems if applicable
+                    if os.path.normcase(common_path) == os.path.normcase(
+                        plex_dir_actual
+                    ):
+                        is_within_plex_dir = True
+
+                self.log_message(
+                    f"Auto-delete check: Is file within Plex dir? {is_within_plex_dir}",
+                    "DEBUG",
+                )
+
+                if is_within_plex_dir:
+                    verified = False
+                    if os.path.exists(output_file_path):
+                        try:
+                            if (
+                                os.path.getsize(output_file_path) > 1024
+                            ):  # Verify: size > 1KB (basic check)
+                                verified = True
+                                self.log_message(
+                                    f"Successfully converted and verified: {output_file_path}",
+                                    "INFO",
+                                )
+                                # print(
+                                #     f"Successfully converted and verified: {output_file_path}"
+                                # )
+                            else:
+                                self.log_message(
+                                    f"Verification FAILED for {output_file_path}: File size too small ({os.path.getsize(output_file_path)} bytes).",
+                                    "WARN",
+                                )
+                                # print(
+                                #     f"Verification FAILED for {output_file_path}: File size too small ({os.path.getsize(output_file_path)} bytes)."
+                                # )
+                                self.master.after(
+                                    0,
+                                    lambda op=output_file_path: self.conversion_status.set(
+                                        f"Status: Verified {os.path.basename(op)} - FAILED (size)."
+                                    ),
+                                )
+                        except OSError as e:
+                            self.log_message(
+                                f"Error getting size for {output_file_path}: {e}",
+                                "ERROR",
+                            )
+                            # print(f"Error getting size for {output_file_path}: {e}")
+                            self.master.after(
+                                0,
+                                lambda op=output_file_path: self.conversion_status.set(
+                                    f"Status: Error verifying {os.path.basename(op)}."
+                                ),
+                            )
+                    else:
+                        self.log_message(
+                            f"Verification FAILED for {output_file_path}: Output file does not exist.",
+                            "WARN",
+                        )
+                        # print(
+                        #     f"Verification FAILED for {output_file_path}: Output file does not exist."
+                        # )
+                        self.master.after(
+                            0,
+                            lambda op=output_file_path
+                            if output_file_path
+                            else "unknown output": self.conversion_status.set(
+                                f"Status: Verified {os.path.basename(op) if output_file_path else 'unknown'} - FAILED (missing)."
+                            ),
+                        )
+
+                    if verified and self.auto_delete_verified_originals.get():
+                        try:
+                            self.log_message(
+                                f"Attempting to delete original file: {current_file_path_normalized}",
+                                "INFO",
+                            )
+                            os.remove(
+                                current_file_path_normalized
+                            )  # Use normalized path for consistency
+                            self.log_message(
+                                f"Successfully deleted original file: {current_file_path_normalized}",
+                                "INFO",
+                            )
+                            self.master.after(
+                                0,
+                                lambda orig=current_file_path_normalized: self.conversion_status.set(
+                                    f"Status: Deleted original {os.path.basename(orig)}."
+                                ),
+                            )
+                        except OSError as e:
+                            self.log_message(
+                                f"Error deleting original file {current_file_path_normalized}: {e}",
+                                "ERROR",
+                            )
+                            # print(
+                            #     f"Error deleting original file {current_file_path_normalized}: {e}"
+                            # )
+                            messagebox.showerror(
+                                "Deletion Error",
+                                f"Could not delete original file: {current_file_path_normalized}\nError: {e}",
+                            )
+                            self.master.after(
+                                0,
+                                lambda orig=current_file_path_normalized: self.conversion_status.set(
+                                    f"Status: Error deleting {os.path.basename(orig)}."
+                                ),
+                            )
+                    elif verified and not self.auto_delete_verified_originals.get():
+                        self.log_message(
+                            f"Original file not deleted (auto-delete is off): {current_file_path_normalized}",
+                            "INFO",
+                        )
+                        self.master.after(
+                            0,
+                            lambda: self.conversion_status.set(
+                                "Status: Original not deleted (auto-delete off)."
+                            ),
+                        )
+                    elif not verified:
+                        self.log_message(
+                            f"Original file not deleted (verification failed): {current_file_path_normalized}",
+                            "WARN",
+                        )
+                else:
+                    self.log_message(
+                        f"Skipping auto-delete for {current_file_path_normalized} as it is not within the selected Plex media directory ('{plex_dir_actual}').",
+                        "INFO",
+                    )
 
         self.is_converting = False
         self.current_ffmpeg_process = None  # Clear process reference
@@ -753,18 +1045,67 @@ class ConverterApp:
             else None,
         )
         self.master.after(
-            0, lambda: messagebox.showinfo("Batch Status", summary_message)
-        )
-        self.master.after(0, self.update_status_with_queue_count)
-        self.master.after(
-            0, self.individual_progress_bar.config, {"value": 0}
-        )  # Final reset of individual bar
-        self.master.after(
             0, self.individual_progress_status.set, "Individual File Progress: N/A"
         )
+        self.log_message(
+            summary_message.replace("\\n", " | "), "INFO"
+        )  # Log the summary
+        self.master.after(
+            0, lambda: self.show_timed_messagebox("Batch Status", summary_message, 5000)
+        )
+
+    def show_timed_messagebox(self, title, message, duration_ms):
+        timed_msg_window = tk.Toplevel(self.master)
+        timed_msg_window.title(title)
+        timed_msg_window.transient(
+            self.master
+        )  # Show above master, and minimize with master
+        timed_msg_window.grab_set()  # Make modal
+
+        msg_label = tk.Label(
+            timed_msg_window, text=message, justify=tk.LEFT, padx=20, pady=20
+        )
+        msg_label.pack()
+
+        ok_button = ttk.Button(
+            timed_msg_window, text="OK", command=timed_msg_window.destroy, width=10
+        )
+        ok_button.pack(pady=10)
+        ok_button.focus_set()  # Set focus to OK button
+
+        # Center the window
+        timed_msg_window.update_idletasks()  # Update geometry
+        master_x = self.master.winfo_x()
+        master_y = self.master.winfo_y()
+        master_width = self.master.winfo_width()
+        master_height = self.master.winfo_height()
+
+        win_width = timed_msg_window.winfo_width()
+        win_height = timed_msg_window.winfo_height()
+
+        x = master_x + (master_width // 2) - (win_width // 2)
+        y = master_y + (master_height // 2) - (win_height // 2)
+        timed_msg_window.geometry(f"+{x}+{y}")
+
+        # Store the window reference to prevent garbage collection if needed for the lambda
+        # and to allow explicit destroy if OK is pressed before timeout.
+        # However, lambda captures window directly.
+
+        # Auto-close after duration_ms
+        timed_msg_window.after(
+            duration_ms,
+            lambda: self._destroy_timed_messagebox_if_exists(timed_msg_window),
+        )
+
+    def _destroy_timed_messagebox_if_exists(self, window_instance):
+        try:
+            if window_instance.winfo_exists():
+                window_instance.destroy()
+        except tk.TclError:
+            pass  # Window already destroyed
 
     def convert_file(self, input_mkv, retry_level=0):
-        """Converts a single file. Returns (True, None) on success, (False, error_message) on failure."""
+        """Converts a single file. Returns (True, output_path) on success, (False, error_message) on failure."""
         if not self.ffmpeg_exec_path:
             return False, "FFmpeg path is not set."
         if self.cancel_requested:  # Check at the very start of conversion attempt
@@ -812,16 +1153,24 @@ class ConverterApp:
             )
             duration_seconds = float(duration_process.stdout.strip())
             if duration_seconds <= 0:
-                print(
-                    f"Warning: Could not determine valid duration for {input_mkv}. Individual progress may be inaccurate."
+                self.log_message(
+                    f"Warning: Could not determine valid duration for {input_mkv}. Individual progress may be inaccurate.",
+                    "WARN",
                 )
+                # print(
+                #     f"Warning: Could not determine valid duration for {input_mkv}. Individual progress may be inaccurate."
+                # )
                 duration_seconds = (
                     0  # Will make progress jump to 100 quickly or stay at 0
                 )
         except Exception as e:
-            print(
-                f"Error getting duration for {input_mkv}: {e}. Individual progress may be inaccurate."
+            self.log_message(
+                f"Error getting duration for {input_mkv}: {e}. Individual progress may be inaccurate.",
+                "ERROR",
             )
+            # print(
+            #     f"Error getting duration for {input_mkv}: {e}. Individual progress may be inaccurate."
+            # )
             # Proceed without duration, progress will be indeterminate or jumpy for this file
             duration_seconds = 0
 
@@ -838,7 +1187,7 @@ class ConverterApp:
                 )  # Increased values for retries
             ffmpeg_cmd.extend(["-i", input_mkv])
 
-            file_suffix = "_converted"
+            # file_suffix = "_converted" # Old default for retry_level == 0
             error_prefix = ""
             current_file_label_suffix = ""
 
@@ -850,6 +1199,8 @@ class ConverterApp:
                 file_suffix = "_retry2"
                 error_prefix = "(Retry Level 2) "
                 current_file_label_suffix = " (Level 2)"
+            else:  # Standard (retry_level == 0)
+                file_suffix = ""  # No suffix, just change extension
 
             if output_format_selected == "MP4 (H.264 + AAC)":
                 output_file_path = f"{output_file_base}{file_suffix}.mp4"
@@ -954,7 +1305,10 @@ class ConverterApp:
                             pass  # Process might have already exited
                         self.current_ffmpeg_process.wait()  # Ensure it's fully terminated
                     self.current_ffmpeg_process = None
-                    return False, "Conversion cancelled."
+                    self.log_message(
+                        f"Conversion of {input_mkv} cancelled during pause.", "INFO"
+                    )
+                    return False, "Conversion cancelled during pause."
 
                 while self.is_paused:
                     if self.cancel_requested:  # Check cancel during pause
@@ -965,6 +1319,9 @@ class ConverterApp:
                                 pass
                             self.current_ffmpeg_process.wait()
                         self.current_ffmpeg_process = None
+                        self.log_message(
+                            f"Conversion of {input_mkv} cancelled during pause.", "INFO"
+                        )
                         return False, "Conversion cancelled during pause."
                     time.sleep(0.1)  # Sleep briefly while paused
 
@@ -1033,7 +1390,7 @@ class ConverterApp:
                     self.individual_progress_status.set,
                     f"Individual File Progress: {current_file_display_name} (Completed)",
                 )
-                return True, None
+                return True, output_file_path
             else:
                 concise_error = (
                     "\n".join(error_output_lines[-5:])
@@ -1068,36 +1425,71 @@ class ConverterApp:
                     if (
                         self.current_ffmpeg_process.poll() is None
                     ):  # Check if still running
+                        self.log_message(
+                            f"Terminating Popen process {self.current_ffmpeg_process.pid} in finally block for {input_mkv}",
+                            "DEBUG",
+                        )
                         self.current_ffmpeg_process.terminate()
                         self.current_ffmpeg_process.wait(timeout=2)  # Brief wait
                 except OSError as e:
-                    print(f"Error in finally terminating Popen: {e}")
+                    self.log_message(
+                        f"Error in finally terminating Popen for {input_mkv}: {e}",
+                        "ERROR",
+                    )
+                    # print(f"Error in finally terminating Popen: {e}")
                 except subprocess.TimeoutExpired:
-                    print("Timeout in finally terminating Popen, trying kill.")
+                    self.log_message(
+                        f"Timeout in finally terminating Popen for {input_mkv}, trying kill.",
+                        "WARN",
+                    )
+                    # print("Timeout in finally terminating Popen, trying kill.")
                     try:
                         self.current_ffmpeg_process.kill()
-                    except OSError as e:
-                        print(f"Error in finally killing Popen: {e}")
-                except Exception as e:  # Catch any other psutil/subprocess issues
-                    print(f"Generic error in Popen cleanup: {e}")
-            self.current_ffmpeg_process = None
-            if self.psutil_process:  # Ensure psutil reference is also cleared
-                try:
-                    # Check if the process still exists and is suspended, try to resume it
-                    # This is a best-effort cleanup, primarily for the *next* file if not batch cancelling
-                    if (
-                        self.psutil_process.is_running()
-                        and self.psutil_process.status() == psutil.STATUS_STOPPED
-                    ):
-                        print(
-                            f"Found suspended process {self.psutil_process.pid} in convert_file finally, attempting resume."
+                        self.log_message(
+                            f"Killed Popen process {self.current_ffmpeg_process.pid} for {input_mkv}",
+                            "DEBUG",
                         )
-                        self.psutil_process.resume()
-                except psutil.NoSuchProcess:
-                    pass  # Process already gone
-                except Exception as e:
-                    print(f"Error handling psutil_process in convert_file finally: {e}")
-            self.psutil_process = None
+                    except OSError as e:
+                        self.log_message(
+                            f"Error in finally killing Popen for {input_mkv}: {e}",
+                            "ERROR",
+                        )
+                        # print(f"Error in finally killing Popen: {e}")
+                except Exception as e:  # Catch any other psutil/subprocess issues
+                    self.log_message(
+                        f"Generic error in Popen cleanup for {input_mkv}: {e}", "ERROR"
+                    )
+                    # print(f"Generic error in Popen cleanup: {e}")
+                self.current_ffmpeg_process = None
+                if self.psutil_process:  # Ensure psutil reference is also cleared
+                    try:
+                        # Check if the process still exists and is suspended, try to resume it
+                        # This is a best-effort cleanup, primarily for the *next* file if not batch cancelling
+                        if (
+                            self.psutil_process.is_running()
+                            and self.psutil_process.status() == psutil.STATUS_STOPPED
+                        ):
+                            self.log_message(
+                                f"Found suspended psutil process {self.psutil_process.pid} in convert_file finally for {input_mkv}, attempting resume.",
+                                "DEBUG",
+                            )
+                            # print(
+                            #     f"Found suspended process {self.psutil_process.pid} in convert_file finally, attempting resume."
+                            # )
+                            self.psutil_process.resume()
+                    except psutil.NoSuchProcess:
+                        self.log_message(
+                            f"psutil.NoSuchProcess for {self.psutil_process.pid if self.psutil_process else 'unknown'} in convert_file finally for {input_mkv}.",
+                            "DEBUG",
+                        )
+                        pass  # Process already gone
+                    except Exception as e:
+                        self.log_message(
+                            f"Error handling psutil_process in convert_file finally for {input_mkv}: {e}",
+                            "ERROR",
+                        )
+                        # print(f"Error handling psutil_process in convert_file finally: {e}")
+                self.psutil_process = None
 
     def toggle_pause_resume(self):
         if not self.is_converting:
@@ -1149,9 +1541,13 @@ class ConverterApp:
                                 self.individual_progress_status.set,
                                 "Individual File Progress: PAUSED",
                             )
-                        print(
-                            f"FFmpeg process {self.current_ffmpeg_process.pid} suspended."
+                        self.log_message(
+                            f"FFmpeg process {self.current_ffmpeg_process.pid} suspended.",
+                            "INFO",
                         )
+                        # print(
+                        #     f"FFmpeg process {self.current_ffmpeg_process.pid} suspended."
+                        # )
                     else:
                         messagebox.showwarning(
                             "Pause Info",
@@ -1172,7 +1568,8 @@ class ConverterApp:
                     messagebox.showerror(
                         "Pause Error", f"Could not suspend FFmpeg process: {e}"
                     )
-                    print(f"Error suspending process: {e}")
+                    self.log_message(f"Error suspending process: {e}", "ERROR")
+                    # print(f"Error suspending process: {e}")
             else:
                 messagebox.showwarning(
                     "Pause Info", "No active FFmpeg process to pause."
@@ -1205,7 +1602,10 @@ class ConverterApp:
                                 self.individual_progress_status.set,
                                 "Individual File Progress: Resuming...",
                             )
-                        print(f"FFmpeg process {self.psutil_process.pid} resumed.")
+                        self.log_message(
+                            f"FFmpeg process {self.psutil_process.pid} resumed.", "INFO"
+                        )
+                        # print(f"FFmpeg process {self.psutil_process.pid} resumed.")
                     else:
                         messagebox.showwarning(
                             "Resume Info",
@@ -1226,7 +1626,8 @@ class ConverterApp:
                     messagebox.showerror(
                         "Resume Error", f"Could not resume FFmpeg process: {e}"
                     )
-                    print(f"Error resuming process: {e}")
+                    self.log_message(f"Error resuming process: {e}", "ERROR")
+                    # print(f"Error resuming process: {e}")
             else:
                 # If psutil_process is None, but we thought we were paused.
                 messagebox.showwarning(
@@ -1253,11 +1654,21 @@ class ConverterApp:
                     try:
                         if self.psutil_process.status() == psutil.STATUS_STOPPED:
                             self.psutil_process.resume()
-                        print("Resumed FFmpeg process before cancelling.")
+                        self.log_message(
+                            "Resumed FFmpeg process before cancelling.", "INFO"
+                        )
+                        # print("Resumed FFmpeg process before cancelling.")
                     except psutil.NoSuchProcess:
-                        print("FFmpeg process for resume-before-cancel not found.")
+                        self.log_message(
+                            "FFmpeg process for resume-before-cancel (batch) not found.",
+                            "WARN",
+                        )
+                        # print("FFmpeg process for resume-before-cancel not found.")
                     except Exception as e:
-                        print(f"Error resuming FFmpeg before cancel: {e}")
+                        self.log_message(
+                            f"Error resuming FFmpeg before batch cancel: {e}", "ERROR"
+                        )
+                        # print(f"Error resuming FFmpeg before cancel: {e}")
                 self.is_paused = (
                     False  # Ensure not stuck in a paused state for UI logic
                 )
@@ -1279,38 +1690,73 @@ class ConverterApp:
                 "A conversion is in progress. Are you sure you want to exit? This will cancel the current batch.",
             ):
                 self.cancel_requested = True
+                self.is_monitoring_plex = False  # Stop monitoring thread as well
 
                 if (
                     self.is_paused and self.psutil_process
                 ):  # If paused by psutil, resume first
                     try:
-                        print("Attempting to resume FFmpeg process before closing...")
+                        self.log_message(
+                            "Attempting to resume FFmpeg process before closing app.",
+                            "INFO",
+                        )
+                        # print("Attempting to resume FFmpeg process before closing...")
                         if self.psutil_process.status() == psutil.STATUS_STOPPED:
                             self.psutil_process.resume()
-                        print("FFmpeg process resumed for closing.")
+                        self.log_message(
+                            "FFmpeg process resumed for closing app.", "INFO"
+                        )
+                        # print("FFmpeg process resumed for closing.")
                     except psutil.NoSuchProcess:
-                        print("FFmpeg process for resume-before-closing not found.")
+                        self.log_message(
+                            "FFmpeg process for resume-before-closing (app) not found.",
+                            "WARN",
+                        )
+                        # print("FFmpeg process for resume-before-closing not found.")
                     except Exception as e:
-                        print(f"Error resuming FFmpeg before closing: {e}")
+                        self.log_message(
+                            f"Error resuming FFmpeg before closing app: {e}", "ERROR"
+                        )
+                        # print(f"Error resuming FFmpeg before closing: {e}")
                 self.is_paused = False  # Ensure not stuck paused
 
                 if self.current_ffmpeg_process:  # This is the subprocess.Popen object
                     try:
-                        print("Attempting to terminate FFmpeg process on closing...")
+                        self.log_message(
+                            f"Attempting to terminate FFmpeg process {self.current_ffmpeg_process.pid} on closing app.",
+                            "INFO",
+                        )
+                        # print("Attempting to terminate FFmpeg process on closing...")
                         self.current_ffmpeg_process.terminate()  # Send SIGTERM
                         self.current_ffmpeg_process.wait(
                             timeout=5
                         )  # Wait for it to die
-                        print("FFmpeg process terminated or timed out.")
-                    except subprocess.TimeoutExpired:
-                        print(
-                            "FFmpeg process did not terminate in time, attempting to kill..."
+                        self.log_message(
+                            f"FFmpeg process {self.current_ffmpeg_process.pid} terminated or timed out on closing.",
+                            "INFO",
                         )
+                        # print("FFmpeg process terminated or timed out.")
+                    except subprocess.TimeoutExpired:
+                        self.log_message(
+                            f"FFmpeg process {self.current_ffmpeg_process.pid} did not terminate in time, attempting to kill...",
+                            "WARN",
+                        )
+                        # print(
+                        #     "FFmpeg process did not terminate in time, attempting to kill..."
+                        # )
                         self.current_ffmpeg_process.kill()  # Force kill if terminate fails
                         self.current_ffmpeg_process.wait(timeout=2)
-                        print("FFmpeg process kill attempt finished.")
+                        self.log_message(
+                            f"FFmpeg process {self.current_ffmpeg_process.pid} kill attempt finished on closing.",
+                            "INFO",
+                        )
+                        # print("FFmpeg process kill attempt finished.")
                     except OSError as e:
-                        print(f"Error terminating/killing FFmpeg process: {e}")
+                        self.log_message(
+                            f"Error terminating/killing FFmpeg process {self.current_ffmpeg_process.pid} on closing: {e}",
+                            "ERROR",
+                        )
+                        # print(f"Error terminating/killing FFmpeg process: {e}")
                     finally:
                         self.current_ffmpeg_process = None
                         self.psutil_process = (
@@ -1320,10 +1766,36 @@ class ConverterApp:
                     self.psutil_process = None
 
                 if self.conversion_thread and self.conversion_thread.is_alive():
-                    print("Waiting for conversion thread to join...")
+                    self.log_message(
+                        "Waiting for conversion thread to join on closing app.", "INFO"
+                    )
+                    # print("Waiting for conversion thread to join...")
                     self.conversion_thread.join(timeout=5)  # Wait for thread to finish
                     if self.conversion_thread.is_alive():
-                        print("Conversion thread did not join in time.")
+                        self.log_message(
+                            "Conversion thread did not join in time on closing app.",
+                            "WARN",
+                        )
+                        # print("Conversion thread did not join in time.")
+
+                if (
+                    self.plex_monitoring_thread
+                    and self.plex_monitoring_thread.is_alive()
+                ):
+                    self.log_message(
+                        "Waiting for Plex monitoring thread to join on closing app.",
+                        "INFO",
+                    )
+                    # print("Waiting for Plex monitoring thread to join...")
+                    self.plex_monitoring_thread.join(
+                        timeout=5
+                    )  # Wait for thread to finish
+                    if self.plex_monitoring_thread.is_alive():
+                        self.log_message(
+                            "Plex monitoring thread did not join in time on closing app.",
+                            "WARN",
+                        )
+                        # print("Plex monitoring thread did not join in time.")
 
                 self.master.destroy()
             else:
@@ -1332,7 +1804,609 @@ class ConverterApp:
             if messagebox.askyesno(
                 "Exit", "Are you sure you want to exit the application?"
             ):
+                self.is_monitoring_plex = False  # Stop monitoring thread before exit
+                if (
+                    self.plex_monitoring_thread
+                    and self.plex_monitoring_thread.is_alive()
+                ):
+                    self.log_message(
+                        "Waiting for Plex monitoring thread to join on exit (no conversion).",
+                        "INFO",
+                    )
+                    # print("Waiting for Plex monitoring thread to join on exit...")
+                    self.plex_monitoring_thread.join(timeout=5)
+                    if self.plex_monitoring_thread.is_alive():
+                        self.log_message(
+                            "Plex monitoring thread did not join in time on exit (no conversion).",
+                            "WARN",
+                        )
+                        # print("Plex monitoring thread did not join in time on exit.")
+                self.save_state()  # Save state before destroying
                 self.master.destroy()
+
+    def select_plex_directory(self):
+        if self.is_converting:
+            messagebox.showwarning(
+                "Busy", "Cannot change directory while conversion is in progress."
+            )
+            return
+
+        if self.is_monitoring_plex:
+            messagebox.showinfo(
+                "Plex Monitoring",
+                "Plex monitoring will be stopped to change the directory.",
+            )
+            self.log_message("Plex monitoring stopped due to directory change.", "INFO")
+            self.toggle_plex_monitoring()  # Stop monitoring
+
+        directory_path = filedialog.askdirectory(title="Select Your Main Media Folder")
+        if directory_path:
+            self.plex_media_directory.set(directory_path)
+            self.scan_plex_dir_button.config(
+                state=tk.NORMAL
+            )  # Enable monitoring button
+            self.conversion_status.set(
+                f"Status: Media folder set to: {directory_path}. Ready to scan or monitor."
+            )
+        else:
+            # self.plex_media_directory.set("Not Set") # Keep old if cancelled, or clear
+            if (
+                self.plex_media_directory.get() == "Not Set"
+                or not self.plex_media_directory.get()
+            ):
+                self.scan_plex_dir_button.config(state=tk.DISABLED)
+
+    def scan_plex_directory_and_add(self, called_from_thread=False):
+        if (
+            self.is_converting and not called_from_thread
+        ):  # Allow scan if called from thread even if converting other files
+            messagebox.showwarning(
+                "Busy", "Cannot start scan while conversion is in progress."
+            )
+            return
+
+        target_dir_display = self.plex_media_directory.get()
+        # Get the actual path for os functions by removing the display suffix
+        actual_target_dir = target_dir_display.replace(
+            " (Monitoring Active)", ""
+        ).strip()
+
+        if (
+            not actual_target_dir
+            or actual_target_dir == "Not Set"
+            or not os.path.isdir(actual_target_dir)
+        ):
+            if not called_from_thread:
+                messagebox.showerror(
+                    "Error",
+                    f"Please select a valid media folder first. Path checked: '{actual_target_dir}'",
+                )
+            else:
+                self.log_message(
+                    f"Scan Plex Dir Error: Invalid or inaccessible media folder. Path checked: '{actual_target_dir}'",
+                    "ERROR",
+                )
+                # print(f"Scan Plex Dir Error: Invalid or inaccessible media folder. Path checked: '{actual_target_dir}'") # Log for thread
+            return
+
+        # Status update before scan is now handled by plex_monitoring_loop
+        # self.master.after(0, lambda: self.conversion_status.set(
+        # f"Status: Scanning {target_dir} for non-MP4 files..."
+        # ))
+        # if not called_from_thread:
+        # self.master.update_idletasks()
+
+        video_extensions_to_scan = (
+            ".mkv",
+            ".avi",
+            ".mov",
+            ".flv",
+            ".wmv",
+            ".mpeg",
+            ".mpg",
+            ".ts",
+            ".m2ts",
+        )
+        files_found_to_convert = []
+
+        for root, _, files in os.walk(
+            actual_target_dir
+        ):  # Use actual_target_dir for os.walk
+            for file in files:
+                file_path = os.path.join(root, file)
+                if file_path.lower().endswith(video_extensions_to_scan):
+                    # Check if an MP4 version already exists (same base name)
+                    base_name, _ = os.path.splitext(file_path)
+                    mp4_equivalent = base_name + ".mp4"
+                    mp4_retry1_equivalent = base_name + "_retry1.mp4"
+                    mp4_retry2_equivalent = base_name + "_retry2.mp4"
+
+                    if not (
+                        os.path.exists(mp4_equivalent)
+                        or os.path.exists(mp4_retry1_equivalent)
+                        or os.path.exists(mp4_retry2_equivalent)
+                    ):
+                        files_found_to_convert.append(file_path)
+                    else:
+                        self.log_message(
+                            f"Plex Scan: Skipping '{file_path}', MP4 version already exists.",
+                            "DEBUG",
+                        )
+                        # print(f"Skipping {file_path}, MP4 version already exists.")
+
+        added_to_queue_count = 0
+        if files_found_to_convert:
+            for file_path in files_found_to_convert:
+                if file_path not in self.file_queue and not any(
+                    fp == file_path for fp, _ in self.failed_files_data
+                ):
+                    self.file_queue.append(file_path)
+                    self.queue_listbox.insert(tk.END, os.path.basename(file_path))
+                    added_to_queue_count += 1
+
+            if added_to_queue_count > 0:
+                final_message = f"Plex Scan: Added {added_to_queue_count} file(s) to queue from {os.path.basename(actual_target_dir)}."
+                if not called_from_thread:
+                    messagebox.showinfo("Scan Complete", final_message)
+                    self.master.after(
+                        0,
+                        lambda: self.conversion_status.set(
+                            f"Status: {final_message} | Queue: {len(self.file_queue)} file(s)."
+                        ),
+                    )
+                else:
+                    self.log_message(final_message, "INFO")
+                    # print(final_message)  # Log for thread
+                    # Status update for "Next scan in..." will be set by the loop after this returns
+                self.master.after(0, self.update_status_with_queue_count)
+            else:
+                final_message = f"Plex Scan: No new files to add from {os.path.basename(actual_target_dir)}."
+                if not called_from_thread:
+                    messagebox.showinfo("Scan Complete", final_message)
+                    self.master.after(
+                        0,
+                        lambda: self.conversion_status.set(
+                            f"Status: {final_message} | Queue: {len(self.file_queue)} file(s)."
+                        ),
+                    )
+                else:
+                    self.log_message(final_message, "INFO")
+                    # print(final_message)  # Log for thread
+        else:  # files_found_to_convert was empty
+            final_message = f"Plex Scan: No non-MP4 files found in {os.path.basename(actual_target_dir)}."
+            if not called_from_thread:
+                messagebox.showinfo("Scan Complete", final_message)
+                self.master.after(
+                    0,
+                    lambda: self.conversion_status.set(
+                        f"Status: {final_message} | Queue: {len(self.file_queue)} file(s)."
+                    ),
+                )
+            else:
+                self.log_message(final_message, "INFO")
+                # print(final_message)  # Log for thread
+
+        # Auto-start conversion if enabled and files were added
+        if (
+            called_from_thread
+            and added_to_queue_count > 0
+            and self.auto_start_plex_conversions.get()
+        ):
+            self.log_message(
+                f"Plex Scan: {added_to_queue_count} file(s) added. Auto-starting conversion.",
+                "INFO",
+            )
+            # Ensure this runs on the main thread and doesn't interfere if already converting
+            self.master.after(0, self._check_and_start_conversion_after_scan)
+
+    def _check_and_start_conversion_after_scan(self):
+        if not self.is_converting and self.file_queue:
+            self.log_message("Auto-starting batch conversion from Plex scan.", "INFO")
+            self.start_conversion_thread()
+        elif self.is_converting:
+            self.log_message(
+                "Auto-start skipped: Conversion already in progress.", "INFO"
+            )
+        elif not self.file_queue:
+            self.log_message(
+                "Auto-start skipped: Queue is empty after Plex scan (unexpected).",
+                "WARN",
+            )
+
+    def save_state(self):
+        state_data = {
+            "file_queue": self.file_queue,
+            "failed_files_data": self.failed_files_data,
+            "files_for_retry_level_1": list(self.files_for_retry_level_1),
+            "files_for_retry_level_2": list(self.files_for_retry_level_2),
+            "plex_media_directory": self.plex_media_directory.get(),
+            "auto_delete_verified_originals": self.auto_delete_verified_originals.get(),
+            "plex_scan_interval_minutes": self.plex_scan_interval_minutes_sv.get(),
+            "auto_start_plex_conversions": self.auto_start_plex_conversions.get(),
+        }
+        try:
+            with open(self.STATE_FILE, "w") as f:
+                json.dump(state_data, f, indent=4)
+            self.log_message(f"Application state saved to {self.STATE_FILE}", "INFO")
+        except IOError as e:
+            self.log_message(
+                f"Error saving application state to {self.STATE_FILE}: {e}", "ERROR"
+            )
+        except Exception as e:
+            self.log_message(
+                f"An unexpected error occurred while saving state: {e}", "ERROR"
+            )
+
+    def load_state(self):
+        try:
+            if os.path.exists(self.STATE_FILE):
+                with open(self.STATE_FILE, "r") as f:
+                    state_data = json.load(f)
+
+                self.file_queue = state_data.get("file_queue", [])
+                self.failed_files_data = state_data.get("failed_files_data", [])
+                self.files_for_retry_level_1 = set(
+                    state_data.get("files_for_retry_level_1", [])
+                )
+                self.files_for_retry_level_2 = set(
+                    state_data.get("files_for_retry_level_2", [])
+                )
+
+                plex_dir = state_data.get("plex_media_directory", "Not Set")
+                # Ensure we don't load " (Monitoring Active)" into the actual variable if app was closed while monitoring
+                self.plex_media_directory.set(
+                    plex_dir.replace(" (Monitoring Active)", "").strip()
+                )
+                if (
+                    self.plex_media_directory.get()
+                    and self.plex_media_directory.get() != "Not Set"
+                    and os.path.isdir(self.plex_media_directory.get())
+                ):
+                    self.scan_plex_dir_button.config(state=tk.NORMAL)
+                else:
+                    self.plex_media_directory.set(
+                        "Not Set"
+                    )  # Ensure it's clean if loaded path is invalid
+                    self.scan_plex_dir_button.config(state=tk.DISABLED)
+
+                self.auto_delete_verified_originals.set(
+                    state_data.get("auto_delete_verified_originals", False)
+                )
+                self.plex_scan_interval_minutes_sv.set(
+                    state_data.get("plex_scan_interval_minutes", "10")
+                )
+                self.auto_start_plex_conversions.set(
+                    state_data.get("auto_start_plex_conversions", False)
+                )
+
+                # Repopulate listboxes
+                self.queue_listbox.delete(0, tk.END)
+                for item in self.file_queue:
+                    # Determine if it's a retry item to display correctly
+                    display_name = os.path.basename(item)
+                    if item in self.files_for_retry_level_1:
+                        display_name += " (Level 1)"
+                    elif item in self.files_for_retry_level_2:
+                        display_name += " (Level 2)"
+                    self.queue_listbox.insert(tk.END, display_name)
+
+                self.failed_listbox.delete(0, tk.END)
+                for path, reason in self.failed_files_data:
+                    self.failed_listbox.insert(tk.END, os.path.basename(path))
+
+                self.update_status_with_queue_count()  # Update buttons and status
+                self.log_message(
+                    f"Application state loaded from {self.STATE_FILE}", "INFO"
+                )
+            else:
+                self.log_message("No previous application state file found.", "INFO")
+        except IOError as e:
+            self.log_message(
+                f"Error loading application state from {self.STATE_FILE}: {e}", "ERROR"
+            )
+            # Don't halt app, just start fresh
+        except json.JSONDecodeError as e:
+            self.log_message(
+                f"Error decoding state file {self.STATE_FILE}: {e}. Starting fresh.",
+                "ERROR",
+            )
+        except Exception as e:
+            self.log_message(
+                f"An unexpected error occurred while loading state: {e}. Starting fresh.",
+                "ERROR",
+            )
+
+    def toggle_plex_monitoring(self):
+        if (
+            self.is_converting and not self.is_monitoring_plex
+        ):  # Allow stopping monitoring even if converting
+            messagebox.showwarning(
+                "Busy",
+                "Cannot start monitoring while a conversion is in progress. Please wait or cancel.",
+            )
+            return
+
+        if self.is_monitoring_plex:
+            # Stop monitoring
+            self.is_monitoring_plex = False
+            self.scan_plex_dir_button.config(text="Start Plex Monitoring")
+            self.plex_interval_entry.config(
+                state=tk.NORMAL
+            )  # Re-enable entry when stopping
+
+            current_plex_path = self.plex_media_directory.get()
+            if current_plex_path.endswith(" (Monitoring Active)"):
+                self.plex_media_directory.set(
+                    current_plex_path.replace(" (Monitoring Active)", "")
+                )
+
+            # Enable the button if a directory is set
+            if (
+                self.plex_media_directory.get()
+                and self.plex_media_directory.get() != "Not Set"
+            ):
+                self.scan_plex_dir_button.config(state=tk.NORMAL)
+            else:
+                self.scan_plex_dir_button.config(state=tk.DISABLED)
+
+            status_parts = self.conversion_status.get().split("|")
+            base_status = status_parts[0].strip()
+            if (
+                "Plex monitoring stopped." not in base_status
+                and "Plex monitoring started." not in base_status
+            ):
+                self.master.after(
+                    0,
+                    self.conversion_status.set,
+                    f"Status: Plex monitoring stopped. | {base_status}",
+                )
+            else:
+                self.master.after(
+                    0,
+                    self.conversion_status.set,
+                    f"Status: Plex monitoring stopped. {status_parts[-1].strip() if len(status_parts) > 1 else ''}",
+                )
+
+            self.log_message("Plex monitoring stopping...", "INFO")
+            # print("Plex monitoring stopping...")
+            if self.plex_monitoring_thread and self.plex_monitoring_thread.is_alive():
+                pass
+        else:
+            # Start monitoring
+            plex_dir = self.plex_media_directory.get()
+            if not plex_dir or plex_dir == "Not Set" or not os.path.isdir(plex_dir):
+                messagebox.showerror(
+                    "Error",
+                    "Please select a valid media folder before starting monitoring.",
+                )
+                return
+
+            try:
+                interval_minutes_val = int(self.plex_scan_interval_minutes_sv.get())
+                if interval_minutes_val <= 0:
+                    messagebox.showerror(
+                        "Error", "Scan interval must be a positive number of minutes."
+                    )
+                    return
+                self.plex_scan_interval_seconds = interval_minutes_val * 60
+            except ValueError:
+                messagebox.showerror(
+                    "Error", "Invalid scan interval. Please enter a number."
+                )
+                return
+
+            self.is_monitoring_plex = True
+            self.scan_plex_dir_button.config(
+                text="Stop Plex Monitoring", state=tk.NORMAL
+            )
+            self.plex_interval_entry.config(
+                state=tk.DISABLED
+            )  # Disable entry when monitoring starts
+
+            current_plex_path = self.plex_media_directory.get()
+            if current_plex_path != "Not Set" and not current_plex_path.endswith(
+                " (Monitoring Active)"
+            ):
+                self.plex_media_directory.set(
+                    f"{current_plex_path} (Monitoring Active)"
+                )
+
+            # Clear previous "Next scan in..." message when starting
+            # Let the plex_monitoring_loop handle the new status
+            base_status_parts = self.conversion_status.get().split("|")
+            current_action_status = "Plex monitoring started."
+            queue_info = (
+                base_status_parts[-1].strip()
+                if len(base_status_parts) > 1
+                and (
+                    "Queue:" in base_status_parts[-1]
+                    or "Files remaining:" in base_status_parts[-1]
+                )
+                else f"Queue: {len(self.file_queue)} file(s)."
+            )
+            self.master.after(
+                0,
+                self.conversion_status.set,
+                f"Status: {current_action_status} | {queue_info}",
+            )
+
+            if self.plex_monitoring_thread and self.plex_monitoring_thread.is_alive():
+                self.log_message(
+                    "Plex monitoring thread already active. Interval possibly updated.",
+                    "INFO",
+                )
+                # print("Monitoring thread already active. Interval possibly updated.")
+            else:
+                self.plex_monitoring_thread = threading.Thread(
+                    target=self.plex_monitoring_loop
+                )
+                self.plex_monitoring_thread.daemon = True
+                self.plex_monitoring_thread.start()
+                self.log_message("Plex monitoring thread started.", "INFO")
+                # print("Plex monitoring thread started.")
+
+    def plex_monitoring_loop(self):
+        self.log_message(
+            f"Plex monitoring loop started. Interval: {self.plex_scan_interval_seconds}s",
+            "INFO",
+        )
+        # print(f"Plex monitoring loop started. Interval: {self.plex_scan_interval_seconds}s")
+        # Initial short delay before first scan to allow UI to update
+        time.sleep(2)
+
+        while self.is_monitoring_plex:
+            current_scan_interval = (
+                self.plex_scan_interval_seconds
+            )  # Use the potentially updated value
+            if self.is_converting:
+                status_msg = "Plex scan paused (conversion active)."
+                self.log_message(status_msg, "DEBUG")
+                # print(status_msg)
+                self.master.after(
+                    0, lambda sm=status_msg: self.update_plex_monitoring_status(sm)
+                )
+                # Wait a shorter time if converting, then re-check
+                wait_interval = min(60, current_scan_interval)
+            elif (
+                not self.plex_media_directory.get()
+                or self.plex_media_directory.get() == "Not Set"
+            ):
+                status_msg = "Plex scan paused (directory not set)."
+                self.log_message(status_msg, "DEBUG")
+                # print(status_msg)
+                self.master.after(
+                    0, lambda sm=status_msg: self.update_plex_monitoring_status(sm)
+                )
+                wait_interval = min(60, current_scan_interval)
+            else:
+                scan_status_msg = f"Plex: Scanning {os.path.basename(self.plex_media_directory.get().replace(' (Monitoring Active)', ''))}..."  # Clean name for log
+                self.log_message(scan_status_msg, "INFO")
+                # print(scan_status_msg)
+                self.master.after(
+                    0, lambda sm=scan_status_msg: self.update_plex_monitoring_status(sm)
+                )
+                self.scan_plex_directory_and_add(called_from_thread=True)
+                # After scan, immediately start countdown for next scan
+                wait_interval = current_scan_interval
+
+            # Countdown loop for the wait_interval or until monitoring is stopped
+            for i in range(wait_interval):
+                if not self.is_monitoring_plex:
+                    break
+                remaining_time = wait_interval - i
+                minutes, seconds = divmod(remaining_time, 60)
+                countdown_msg = f"Plex: Next scan in {minutes}m {seconds}s."
+                # Log less frequently for countdown to avoid spamming logs
+                if (
+                    i % 30 == 0 or i == wait_interval - 1
+                ):  # Log every 30s or last second before new state
+                    self.log_message(
+                        f"Plex monitoring countdown: {remaining_time}s remaining.",
+                        "DEBUG",
+                    )
+
+                if self.is_converting:
+                    countdown_msg = f"Plex: Monitoring paused (conversion active). Next check in {minutes}m {seconds}s."
+                elif (
+                    not self.plex_media_directory.get()
+                    or self.plex_media_directory.get() == "Not Set"
+                ):
+                    countdown_msg = f"Plex: Monitoring paused (directory not set). Next check in {minutes}m {seconds}s."
+
+                self.master.after(
+                    0, lambda cm=countdown_msg: self.update_plex_monitoring_status(cm)
+                )
+                time.sleep(1)
+
+        self.log_message("Plex monitoring loop finished.", "INFO")
+        # print("Plex monitoring loop finished.")
+        self.master.after(
+            0, lambda: self.update_plex_monitoring_status("Plex monitoring stopped.")
+        )
+
+    def update_plex_monitoring_status(self, plex_status_text):
+        current_status = self.conversion_status.get()
+        parts = current_status.split("|")
+        main_action_status = parts[0].strip()
+
+        # Preserve main action status (Idle, Converting, Batch Finished, etc.)
+        # unless the plex_status_text itself is a primary status like "Plex monitoring stopped."
+        if (
+            plex_status_text == "Plex monitoring stopped."
+            or plex_status_text == "Plex monitoring started."
+        ):
+            new_main_status = plex_status_text
+            queue_info = (
+                parts[-1].strip()
+                if len(parts) > 1
+                and ("Queue:" in parts[-1] or "Files remaining:" in parts[-1])
+                else f"Queue: {len(self.file_queue)} file(s)."
+            )
+            self.conversion_status.set(f"Status: {new_main_status} | {queue_info}")
+        elif (
+            "Plex:" in plex_status_text or "Plex scan paused" in plex_status_text
+        ):  # Plex specific sub-status
+            # Try to find existing queue info or general status
+            # If main_action_status is already a plex status, replace it.
+            if (
+                "Plex:" in main_action_status
+                or "Plex scan paused" in main_action_status
+                or "Plex monitoring stopped." in main_action_status
+                or "Plex monitoring started." in main_action_status
+            ):
+                core_status = "Idle"  # Default if we are overwriting a plex status
+                # Attempt to find a non-Plex part of the status if it exists
+                # This logic could be more robust if needed.
+                if len(parts) > 1 and not (
+                    "Plex:" in parts[0] or "Plex scan paused" in parts[0]
+                ):
+                    core_status = parts[0].replace("Status:", "").strip()
+                elif len(parts) == 1 and not (
+                    "Plex:" in current_status or "Plex scan paused" in current_status
+                ):
+                    core_status = current_status.replace("Status:", "").strip()
+                self.conversion_status.set(
+                    f"Status: {core_status} | {plex_status_text}"
+                )
+            else:
+                # Append Plex status as a secondary part if there's other primary info
+                queue_info = (
+                    parts[-1].strip()
+                    if len(parts) > 1
+                    and ("Queue:" in parts[-1] or "Files remaining:" in parts[-1])
+                    else f"Queue: {len(self.file_queue)} file(s)."
+                )
+                if main_action_status.startswith("Status:"):
+                    main_action_status = main_action_status.replace(
+                        "Status:", ""
+                    ).strip()
+                self.conversion_status.set(
+                    f"Status: {main_action_status} | {plex_status_text} | {queue_info}"
+                )
+        else:  # General status update not specifically from Plex monitoring loop countdown
+            # This case might not be hit often if plex_status_text is always specific
+            self.conversion_status.set(
+                f"Status: {plex_status_text} | Queue: {len(self.file_queue)} file(s)."
+            )
+
+    def log_message(self, message, level="INFO"):
+        # Ensure UI updates happen on the main thread
+        self.master.after(0, self._do_log_message, message, level)
+
+    def _do_log_message(self, message, level):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_message = f"[{timestamp}] [{level.upper()}] {message}\n"
+
+        current_state = self.log_text_area.cget("state")
+        self.log_text_area.config(state=tk.NORMAL)
+        self.log_text_area.insert(tk.END, formatted_message)
+        self.log_text_area.see(tk.END)  # Scroll to the end
+        self.log_text_area.config(
+            state=current_state
+        )  # Restore original state (usually DISABLED)
+        # If starting disabled, we should enable, write, then disable.
+        if current_state == tk.DISABLED:
+            self.log_text_area.config(state=tk.DISABLED)
 
 
 if __name__ == "__main__":

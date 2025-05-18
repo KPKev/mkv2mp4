@@ -1,0 +1,10 @@
+{
+    "file_queue": [],
+    "failed_files_data": [],
+    "files_for_retry_level_1": [],
+    "files_for_retry_level_2": [],
+    "plex_media_directory": "//UNIVERSE/data/media/tv/The Curse of Oak Island/Season 12",
+    "auto_delete_verified_originals": true,
+    "plex_scan_interval_minutes": "30",
+    "auto_start_plex_conversions": true
+}
