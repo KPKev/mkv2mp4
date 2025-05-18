@@ -106,6 +106,7 @@ class ConverterApp:
         self.is_monitoring_plex = False  # True if Plex monitoring is active
         self.plex_monitoring_thread = None  # Thread for Plex monitoring
         self.plex_scan_interval_seconds = 600  # e.g., 10 minutes
+        self.use_gpu_acceleration = tk.BooleanVar(value=False)  # For NVENC
 
         # --- UI Elements (now placed in main_ui_container which is converter_tab_frame) ---
         current_row = 0
@@ -221,6 +222,18 @@ class ConverterApp:
         if len(self.format_options) == 1:  # If only one option, disable the dropdown
             self.output_format.set(self.format_options[0])
             self.format_dropdown.config(state=tk.DISABLED)
+
+        # GPU Acceleration Checkbox
+        self.gpu_checkbox = tk.Checkbutton(
+            main_ui_container,  # Or an appropriate sub-frame
+            text="Use GPU Acceleration (NVIDIA NVENC)",
+            variable=self.use_gpu_acceleration,
+        )
+        # Place it before the action_frame
+        self.gpu_checkbox.grid(
+            row=current_row, column=0, columnspan=4, padx=10, pady=(0, 5), sticky="w"
+        )
+        current_row += 1  # Increment row after adding the checkbox
 
         # Action Buttons Frame (Start, Pause, Cancel)
         action_frame = tk.Frame(main_ui_container)
@@ -887,157 +900,118 @@ class ConverterApp:
                 output_file_path = (
                     result_payload  # This is the output_file_path from convert_file
                 )
-                plex_dir_display = self.plex_media_directory.get()
-                plex_dir_actual = os.path.normpath(
-                    plex_dir_display.replace(" (Monitoring Active)", "").strip()
-                )
                 current_file_path_normalized = os.path.normpath(current_file_path)
 
-                self.log_message(
-                    f"Auto-delete check: Plex dir actual: '{plex_dir_actual}', Current file normalized: '{current_file_path_normalized}'",
-                    "DEBUG",
-                )
-
-                # Check if original file is within the selected media directory and auto-delete is on
-                is_within_plex_dir = False
-                if (
-                    plex_dir_actual
-                    and plex_dir_actual != os.path.normpath("Not Set")
-                    and os.path.isdir(plex_dir_actual)
-                ):
-                    common_path = os.path.commonpath(
-                        [current_file_path_normalized, plex_dir_actual]
-                    )
-                    self.log_message(
-                        f"Auto-delete check: Common path: '{common_path}', Plex_dir_actual: '{plex_dir_actual}'",
-                        "DEBUG",
-                    )
-                    # Normalize for comparison too, especially for case sensitivity on some systems if applicable
-                    if os.path.normcase(common_path) == os.path.normcase(
-                        plex_dir_actual
-                    ):
-                        is_within_plex_dir = True
-
-                self.log_message(
-                    f"Auto-delete check: Is file within Plex dir? {is_within_plex_dir}",
-                    "DEBUG",
-                )
-
-                if is_within_plex_dir:
-                    verified = False
-                    if os.path.exists(output_file_path):
-                        try:
-                            if (
-                                os.path.getsize(output_file_path) > 1024
-                            ):  # Verify: size > 1KB (basic check)
-                                verified = True
-                                self.log_message(
-                                    f"Successfully converted and verified: {output_file_path}",
-                                    "INFO",
-                                )
-                                # print(
-                                #     f"Successfully converted and verified: {output_file_path}"
-                                # )
-                            else:
-                                self.log_message(
-                                    f"Verification FAILED for {output_file_path}: File size too small ({os.path.getsize(output_file_path)} bytes).",
-                                    "WARN",
-                                )
-                                # print(
-                                #     f"Verification FAILED for {output_file_path}: File size too small ({os.path.getsize(output_file_path)} bytes)."
-                                # )
-                                self.master.after(
-                                    0,
-                                    lambda op=output_file_path: self.conversion_status.set(
-                                        f"Status: Verified {os.path.basename(op)} - FAILED (size)."
-                                    ),
-                                )
-                        except OSError as e:
+                verified = False
+                if os.path.exists(output_file_path):
+                    try:
+                        if (
+                            os.path.getsize(output_file_path)
+                            > 10 * 1024 * 1024  # Verify: size > 10MB
+                        ):
+                            verified = True
                             self.log_message(
-                                f"Error getting size for {output_file_path}: {e}",
-                                "ERROR",
+                                f"Successfully converted and verified: {output_file_path}",
+                                "INFO",
                             )
-                            # print(f"Error getting size for {output_file_path}: {e}")
+                            # print(
+                            #     f"Successfully converted and verified: {output_file_path}"
+                            # )
+                        else:
+                            self.log_message(
+                                f"Verification FAILED for {output_file_path}: File size too small ({os.path.getsize(output_file_path)} bytes).",
+                                "WARN",
+                            )
+                            # print(
+                            #     f"Verification FAILED for {output_file_path}: File size too small ({os.path.getsize(output_file_path)} bytes)."
+                            # )
                             self.master.after(
                                 0,
                                 lambda op=output_file_path: self.conversion_status.set(
-                                    f"Status: Error verifying {os.path.basename(op)}."
+                                    f"Status: Verified {os.path.basename(op)} - FAILED (size)."
                                 ),
                             )
-                    else:
+                    except OSError as e:
                         self.log_message(
-                            f"Verification FAILED for {output_file_path}: Output file does not exist.",
-                            "WARN",
+                            f"Error getting size for {output_file_path}: {e}",
+                            "ERROR",
                         )
-                        # print(
-                        #     f"Verification FAILED for {output_file_path}: Output file does not exist."
-                        # )
+                        # print(f"Error getting size for {output_file_path}: {e}")
                         self.master.after(
                             0,
-                            lambda op=output_file_path
-                            if output_file_path
-                            else "unknown output": self.conversion_status.set(
-                                f"Status: Verified {os.path.basename(op) if output_file_path else 'unknown'} - FAILED (missing)."
+                            lambda op=output_file_path: self.conversion_status.set(
+                                f"Status: Error verifying {os.path.basename(op)}."
                             ),
                         )
+                else:
+                    self.log_message(
+                        f"Verification FAILED for {output_file_path}: Output file does not exist.",
+                        "WARN",
+                    )
+                    # print(
+                    #     f"Verification FAILED for {output_file_path}: Output file does not exist."
+                    # )
+                    self.master.after(
+                        0,
+                        lambda op=output_file_path
+                        if output_file_path
+                        else "unknown output": self.conversion_status.set(
+                            f"Status: Verified {os.path.basename(op) if output_file_path else 'unknown'} - FAILED (missing)."
+                        ),
+                    )
 
-                    if verified and self.auto_delete_verified_originals.get():
-                        try:
-                            self.log_message(
-                                f"Attempting to delete original file: {current_file_path_normalized}",
-                                "INFO",
-                            )
-                            os.remove(
-                                current_file_path_normalized
-                            )  # Use normalized path for consistency
-                            self.log_message(
-                                f"Successfully deleted original file: {current_file_path_normalized}",
-                                "INFO",
-                            )
-                            self.master.after(
-                                0,
-                                lambda orig=current_file_path_normalized: self.conversion_status.set(
-                                    f"Status: Deleted original {os.path.basename(orig)}."
-                                ),
-                            )
-                        except OSError as e:
-                            self.log_message(
-                                f"Error deleting original file {current_file_path_normalized}: {e}",
-                                "ERROR",
-                            )
-                            # print(
-                            #     f"Error deleting original file {current_file_path_normalized}: {e}"
-                            # )
-                            messagebox.showerror(
-                                "Deletion Error",
-                                f"Could not delete original file: {current_file_path_normalized}\nError: {e}",
-                            )
-                            self.master.after(
-                                0,
-                                lambda orig=current_file_path_normalized: self.conversion_status.set(
-                                    f"Status: Error deleting {os.path.basename(orig)}."
-                                ),
-                            )
-                    elif verified and not self.auto_delete_verified_originals.get():
+                if verified and self.auto_delete_verified_originals.get():
+                    try:
                         self.log_message(
-                            f"Original file not deleted (auto-delete is off): {current_file_path_normalized}",
+                            f"Attempting to delete original file: {current_file_path_normalized}",
+                            "INFO",
+                        )
+                        os.remove(
+                            current_file_path_normalized
+                        )  # Use normalized path for consistency
+                        self.log_message(
+                            f"Successfully deleted original file: {current_file_path_normalized}",
                             "INFO",
                         )
                         self.master.after(
                             0,
-                            lambda: self.conversion_status.set(
-                                "Status: Original not deleted (auto-delete off)."
+                            lambda orig=current_file_path_normalized: self.conversion_status.set(
+                                f"Status: Deleted original {os.path.basename(orig)}."
                             ),
                         )
-                    elif not verified:
+                    except OSError as e:
                         self.log_message(
-                            f"Original file not deleted (verification failed): {current_file_path_normalized}",
-                            "WARN",
+                            f"Error deleting original file {current_file_path_normalized}: {e}",
+                            "ERROR",
                         )
-                else:
+                        # print(
+                        #     f"Error deleting original file {current_file_path_normalized}: {e}"
+                        # )
+                        messagebox.showerror(
+                            "Deletion Error",
+                            f"Could not delete original file: {current_file_path_normalized}\nError: {e}",
+                        )
+                        self.master.after(
+                            0,
+                            lambda orig=current_file_path_normalized: self.conversion_status.set(
+                                f"Status: Error deleting {os.path.basename(orig)}."
+                            ),
+                        )
+                elif verified and not self.auto_delete_verified_originals.get():
                     self.log_message(
-                        f"Skipping auto-delete for {current_file_path_normalized} as it is not within the selected Plex media directory ('{plex_dir_actual}').",
+                        f"Original file not deleted (auto-delete is off): {current_file_path_normalized}",
                         "INFO",
+                    )
+                    self.master.after(
+                        0,
+                        lambda: self.conversion_status.set(
+                            "Status: Original not deleted (auto-delete off)."
+                        ),
+                    )
+                elif not verified:
+                    self.log_message(
+                        f"Original file not deleted (verification failed): {current_file_path_normalized}",
+                        "WARN",
                     )
 
         self.is_converting = False
@@ -1210,7 +1184,6 @@ class ConverterApp:
                 )  # Increased values for retries
             ffmpeg_cmd.extend(["-i", input_mkv])
 
-            # file_suffix = "_converted" # Old default for retry_level == 0
             error_prefix = ""
             current_file_label_suffix = ""
 
@@ -1227,71 +1200,142 @@ class ConverterApp:
 
             if output_format_selected == "MP4 (H.264 + AAC)":
                 output_file_path = f"{output_file_base}{file_suffix}.mp4"
-                if retry_level == 1:  # Level 1 Recovery (Balanced)
-                    ffmpeg_cmd.extend(
-                        [
-                            "-c:v",
-                            "libx264",
-                            "-profile:v",
-                            "main",
-                            "-preset",
-                            "medium",
-                            "-crf",
-                            "23",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "128k",
-                            "-err_detect",
-                            "ignore_err",
-                            "-fflags",
-                            "+genpts+discardcorrupt",
-                            "-y",
-                            output_file_path,
-                        ]
+
+                if self.use_gpu_acceleration.get():
+                    self.log_message(
+                        f"Using GPU acceleration (h264_nvenc) for {input_mkv}", "INFO"
                     )
-                elif retry_level == 2:  # Level 2 Recovery (Lax)
-                    ffmpeg_cmd.extend(
-                        [
-                            "-c:v",
-                            "libx264",
-                            "-profile:v",
-                            "baseline",
-                            "-preset",
-                            "ultrafast",
-                            "-crf",
-                            "28",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "96k",
-                            "-err_detect",
-                            "ignore_err",
-                            "-fflags",
-                            "+genpts+discardcorrupt",
-                            "-y",
-                            output_file_path,
-                        ]
-                    )
-                else:  # Standard (Level 0) MP4 conversion - H.264 High Profile, but not PS5 specific level
-                    ffmpeg_cmd.extend(
-                        [
-                            "-c:v",
-                            "libx264",
-                            "-profile:v",
-                            "high",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-y",
-                            output_file_path,
-                        ]
-                    )
+                    # NVENC specific settings
+                    common_nvenc_settings = [
+                        "-c:v",
+                        "h264_nvenc",
+                        "-pix_fmt",
+                        "yuv420p",
+                    ]
+
+                    if retry_level == 1:  # Level 1 Recovery (Balanced) with GPU
+                        ffmpeg_cmd.extend(common_nvenc_settings)
+                        ffmpeg_cmd.extend(
+                            [
+                                "-preset",
+                                "p4",  # NVENC medium preset
+                                "-cq",
+                                "25",  # NVENC Constant Quality
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                                "-err_detect",
+                                "ignore_err",
+                                "-fflags",
+                                "+genpts+discardcorrupt",
+                                "-y",
+                                output_file_path,
+                            ]
+                        )
+                    elif retry_level == 2:  # Level 2 Recovery (Lax) with GPU
+                        ffmpeg_cmd.extend(common_nvenc_settings)
+                        ffmpeg_cmd.extend(
+                            [
+                                "-preset",
+                                "p1",  # NVENC fastest preset
+                                "-cq",
+                                "28",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "96k",
+                                "-err_detect",
+                                "ignore_err",
+                                "-fflags",
+                                "+genpts+discardcorrupt",
+                                "-y",
+                                output_file_path,
+                            ]
+                        )
+                    else:  # Standard (Level 0) MP4 conversion with GPU
+                        ffmpeg_cmd.extend(common_nvenc_settings)
+                        ffmpeg_cmd.extend(
+                            [
+                                "-preset",
+                                "p5",  # NVENC good quality preset
+                                "-cq",
+                                "23",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-y",
+                                output_file_path,
+                            ]
+                        )
+                else:  # CPU-based libx264 commands (existing logic)
+                    self.log_message(f"Using CPU (libx264) for {input_mkv}", "INFO")
+                    if retry_level == 1:  # Level 1 Recovery (Balanced)
+                        ffmpeg_cmd.extend(
+                            [
+                                "-c:v",
+                                "libx264",
+                                "-profile:v",
+                                "main",
+                                "-preset",
+                                "medium",
+                                "-crf",
+                                "23",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                                "-err_detect",
+                                "ignore_err",
+                                "-fflags",
+                                "+genpts+discardcorrupt",
+                                "-y",
+                                output_file_path,
+                            ]
+                        )
+                    elif retry_level == 2:  # Level 2 Recovery (Lax)
+                        ffmpeg_cmd.extend(
+                            [
+                                "-c:v",
+                                "libx264",
+                                "-profile:v",
+                                "baseline",
+                                "-preset",
+                                "ultrafast",
+                                "-crf",
+                                "28",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "96k",
+                                "-err_detect",
+                                "ignore_err",
+                                "-fflags",
+                                "+genpts+discardcorrupt",
+                                "-y",
+                                output_file_path,
+                            ]
+                        )
+                    else:  # Standard (Level 0) MP4 conversion - H.264 High Profile, but not PS5 specific level
+                        ffmpeg_cmd.extend(
+                            [
+                                "-c:v",
+                                "libx264",
+                                "-profile:v",
+                                "high",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-y",
+                                output_file_path,
+                            ]
+                        )
             else:
                 return (
                     False,
@@ -2046,6 +2090,7 @@ class ConverterApp:
             "auto_delete_verified_originals": self.auto_delete_verified_originals.get(),
             "plex_scan_interval_minutes": self.plex_scan_interval_minutes_sv.get(),
             "auto_start_plex_conversions": self.auto_start_plex_conversions.get(),
+            "use_gpu_acceleration": self.use_gpu_acceleration.get(),  # Save GPU setting
         }
         try:
             with open(self.STATE_FILE, "w") as f:
@@ -2100,6 +2145,11 @@ class ConverterApp:
                 )
                 self.auto_start_plex_conversions.set(
                     state_data.get("auto_start_plex_conversions", False)
+                )
+                self.use_gpu_acceleration.set(
+                    state_data.get(
+                        "use_gpu_acceleration", False
+                    )  # Load GPU setting, default to False
                 )
 
                 # Repopulate listboxes
